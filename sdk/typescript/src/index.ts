@@ -52,6 +52,8 @@ export {
 // --- Config types ---
 export type {
   HeadroomMode,
+  CompressMode,
+  CompressRequestConfig,
   RelevanceTier,
   ContentType,
   BlockKind,

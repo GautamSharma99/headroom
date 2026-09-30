@@ -4,6 +4,7 @@
  */
 
 import type { CompressionHooks } from "./hooks.js";
+import type { CompressRequestConfig } from "./types/config.js";
 
 // --- Message types (OpenAI chat format) ---
 
@@ -69,10 +70,18 @@ export interface CompressOptions {
   hooks?: CompressionHooks;
   /** Integration slug sent as X-Headroom-Stack (e.g. "adapter_ts_openai"). */
   stack?: string;
+  /** Per-call /v1/compress config, merged over the client-level config
+   *  (per-call keys override at the top level). */
+  config?: CompressRequestConfig;
 }
 
 export interface CompressResult {
-  /** Compressed messages in the same format as input. */
+  /**
+   * Compressed messages in the same format as input. Typed `any[]` because the
+   * universal `compress()` returns messages in the *input* format — it calls
+   * `fromOpenAI(messages, inputFormat)`, so for Anthropic/Vercel/Gemini input
+   * these are not OpenAI-shaped. See the note on `HeadroomClient.compress`.
+   */
   messages: any[];
   tokensBefore: number;
   tokensAfter: number;
@@ -88,6 +97,8 @@ export interface ClientCompressOptions {
   tokenBudget?: number;
   /** Per-message compression bias keyed by message index. */
   biases?: Record<number, number>;
+  /** Per-call compression configuration overrides. */
+  config?: CompressRequestConfig;
 }
 
 // --- Client ---

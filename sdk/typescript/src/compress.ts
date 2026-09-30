@@ -25,6 +25,7 @@ export async function compress(
     model,
     tokenBudget,
     hooks,
+    config,
     ...clientOptions
   } = options;
 
@@ -61,6 +62,7 @@ export async function compress(
     model,
     tokenBudget,
     ...(biases !== undefined ? { biases } : {}),
+    config,
   });
 
   // 6. Convert compressed messages back to original format
