@@ -41,9 +41,14 @@ class TokenCountCache:
     characters are capped.
 
     No lock: ``dict`` get/set/clear are atomic under the GIL, and the pipeline
-    runs on a thread pool. An LRU would need ``move_to_end``, which is not
-    atomic — hence clear-on-full rather than eviction. A cleared cache costs one
-    re-encode, never a wrong answer.
+    runs on a thread pool. A true LRU would need ``move_to_end`` on every hit,
+    which is not atomic — hence no per-key eviction. A full cache still clears,
+    but only on the one put that admits a new key past the cap: repeated
+    re-counts of *known* texts (an agent loop re-counting a stable prefix on
+    every request) are pure dict hits and never trip the eviction, so the
+    classic storm — one fresh tool_result per request evicting the whole
+    cache and forcing a full-prefix re-encode — cannot happen. A cleared
+    cache costs one re-encode, never a wrong answer.
     """
 
     __slots__ = ("_chars", "_counts", "_max_chars", "_max_entries", "_min_chars")
@@ -66,8 +71,21 @@ class TokenCountCache:
         return self._counts.get(text)
 
     def put(self, text: str, count: int) -> None:
-        """Store *count* for *text* if it is worth caching."""
+        """Store *count* for *text* if it is worth caching.
+
+        A re-count of an entry already in the cache is a hit, not an
+        admission: updating the stored value cannot grow the cache, so it
+        must not run the eviction check (a dict hit would clear the whole
+        cache and force a full re-encode of every cached message on the
+        next miss — the storm this exists to prevent).
+        Oversized texts are never admitted, so warm entries survive.
+        """
+        if text in self._counts:
+            self._counts[text] = count
+            return
         if len(text) < self._min_chars:
+            return
+        if len(text) > self._max_chars:
             return
         if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:
             self._counts.clear()
@@ -196,16 +214,22 @@ class BaseTokenizer(ABC):
 
             # Count role
             role = message.get("role", "")
-            total += self.count_text(role)
+            total += self.count_text(coerce_countable_text(role))
 
             # Count content
             content = message.get("content")
+            if isinstance(content, dict):
+                # A single block sent without its list wrapper is priced like
+                # the wrapped block, so images keep their fixed estimate (#4273).
+                content = [content]
             if content is not None:
                 if isinstance(content, str):
                     total += self.count_text(content)
                 elif isinstance(content, list):
                     # Multi-part content (images, tool results, etc.)
                     total += self._count_content_parts(content)
+                else:
+                    total += self.count_text(coerce_countable_text(content))
 
             # Count tool calls
             tool_calls = message.get("tool_calls")
@@ -220,7 +244,7 @@ class BaseTokenizer(ABC):
             # Count name field
             name = message.get("name")
             if name:
-                total += self.count_text(name)
+                total += self.count_text(coerce_countable_text(name))
                 total += 1  # Name field overhead
 
         # Reply start overhead
@@ -240,7 +264,7 @@ class BaseTokenizer(ABC):
                 part_type = part.get("type", "")
 
                 if part_type == "text":
-                    total += self.count_text(part.get("text", ""))
+                    total += self.count_text(coerce_countable_text(part.get("text", "")))
                 elif part_type in ("image_url", "image", "input_image"):
                     # Images are NOT tokenized as text — they have a pixel-based cost.
                     # Anthropic: tokens = (width * height) / 750, max ~1600 after resize.
@@ -266,15 +290,15 @@ class BaseTokenizer(ABC):
                     else:
                         total += self._count_serialized(content)
                 elif part_type == "tool_use":
-                    total += self.count_text(part.get("name", ""))
+                    total += self.count_text(coerce_countable_text(part.get("name", "")))
                     total += self._count_serialized(part.get("input", {}))
                 elif not part_type and "text" in part:
                     # Strands SDK format: {"text": "..."} without "type" field
-                    total += self.count_text(part["text"])
+                    total += self.count_text(coerce_countable_text(part["text"]))
                 elif not part_type and "toolUse" in part:
                     # Strands SDK tool_use: {"toolUse": {"name": ..., "input": ...}}
                     tool_use = part["toolUse"]
-                    total += self.count_text(tool_use.get("name", ""))
+                    total += self.count_text(coerce_countable_text(tool_use.get("name", "")))
                     total += self._count_serialized(tool_use.get("input", {}))
                 elif not part_type and "toolResult" in part:
                     # Strands SDK tool_result: {"toolResult": {"content": [...]}}
@@ -293,7 +317,9 @@ class BaseTokenizer(ABC):
                     reasoning = part["reasoningContent"]
                     reasoning_text = reasoning.get("reasoningText", {})
                     if isinstance(reasoning_text, dict):
-                        total += self.count_text(reasoning_text.get("text", ""))
+                        total += self.count_text(
+                            coerce_countable_text(reasoning_text.get("text", ""))
+                        )
                     elif isinstance(reasoning_text, str):
                         total += self.count_text(reasoning_text)
                 elif not part_type and "document" in part:
@@ -343,7 +369,7 @@ class BaseTokenizer(ABC):
                     # ~4 bytes/token (len * 3/4 / 4), which lands that session
                     # near the provider figure and never prices an omitted
                     # block at zero.
-                    total += self.count_text(part.get("thinking", "") or "")
+                    total += self.count_text(coerce_countable_text(part.get("thinking", "") or ""))
                     total += len(part.get("signature") or "") * 3 // 16
                 else:
                     # Unknown type - estimate from JSON
@@ -388,7 +414,9 @@ class BaseTokenizer(ABC):
         source = image_data.get("source", {})
         img_bytes = source.get("bytes", b"")
 
-        if isinstance(img_bytes, bytes | bytearray) and len(img_bytes) > 0:
+        from headroom.image.decoder_guard import pillow_is_safe
+
+        if isinstance(img_bytes, bytes | bytearray) and len(img_bytes) > 0 and pillow_is_safe():
             try:
                 import io
 

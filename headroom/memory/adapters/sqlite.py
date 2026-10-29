@@ -9,17 +9,22 @@ Provides persistent storage for Memory objects with full support for:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
@@ -62,6 +67,12 @@ class SQLiteMemoryStore:
     Schema:
         The memories table stores all Memory fields with appropriate indexes
         for efficient querying by scope, category, importance, and time.
+
+    Metadata filters:
+        Numbers and booleans use native SQLite equality. String filters match only
+        JSON text values. None matches an explicit JSON null,
+        not a missing key. Arrays and objects compare as compact JSON text with
+        matching JSON types; array order and object member order are significant.
     """
 
     def __init__(self, db_path: str | Path = "headroom_memory.db") -> None:
@@ -73,15 +84,22 @@ class SQLiteMemoryStore:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
+        The file is created, or narrowed, owner-only before sqlite opens it:
+        it holds memory content and the user ids it belongs to.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory store")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -559,13 +577,22 @@ class SQLiteMemoryStore:
                 # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
                 # nothing. ``bool`` is a subclass of ``int``, so it is covered here
                 # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
-                # A non-scalar value (dict/list) is not a bindable SQLite type, so it
-                # keeps the JSON-text comparison rather than raising.
-                conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                if isinstance(value, (str, int, float)):
+                if value is None:
+                    # json_extract returns SQL NULL for both null and missing keys.
+                    conditions.append(f"json_type(metadata, '$.{key}') = 'null'")
+                elif isinstance(value, (str, int, float)):
+                    if isinstance(value, str):
+                        # Extracted JSON arrays/objects are also SQL text.
+                        conditions.append(f"json_type(metadata, '$.{key}') = 'text'")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = ?")
                     params.append(value)
                 else:
-                    params.append(json.dumps(value))
+                    # Normalize whitespace like json_extract does for arrays/objects,
+                    # and do not match a string containing the same JSON text.
+                    encoded = json.dumps(value)
+                    conditions.append(f"json_type(metadata, '$.{key}') = json_type(?)")
+                    conditions.append(f"json_extract(metadata, '$.{key}') = json(?)")
+                    params.extend([encoded, encoded])
 
         return conditions, params
 
@@ -786,23 +813,28 @@ class SQLiteMemoryStore:
             return []
 
         history: list[Memory] = [current]
+        # Imported or reused IDs can form cycles. Visit each stored record
+        # only once across both directions instead of blocking indefinitely.
+        visited = {current.id}
 
         # Follow chain backwards (supersedes)
         back_id = current.supersedes
-        while back_id is not None:
+        while back_id is not None and back_id not in visited:
             prev = await self.get(back_id)
             if prev is None:
                 break
+            visited.add(prev.id)
             history.insert(0, prev)  # Add to beginning
             back_id = prev.supersedes
 
         # Follow chain forwards (superseded_by) if requested
         if include_future:
             forward_id = current.superseded_by
-            while forward_id is not None:
+            while forward_id is not None and forward_id not in visited:
                 next_mem = await self.get(forward_id)
                 if next_mem is None:
                     break
+                visited.add(next_mem.id)
                 history.append(next_mem)
                 forward_id = next_mem.superseded_by
 
@@ -867,9 +899,19 @@ class SQLiteMemoryStore:
     def count_sync(self) -> int:
         """Synchronous count of all memories (for diagnostics).
 
+        .. deprecated::
+            Nothing in Headroom calls this. Use the async
+            ``count(MemoryFilter(include_superseded=True))`` instead.
+
         Returns:
             Total number of memories in the store.
         """
+        warnings.warn(
+            "SQLiteMemoryStore.count_sync is deprecated and will be removed in a future "
+            "release; use the async count(MemoryFilter(include_superseded=True)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM memories")
             result = cursor.fetchone()[0]
